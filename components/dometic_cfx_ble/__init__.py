@@ -96,6 +96,16 @@ TOPIC_TYPES = cv.one_of(
     "DC_CURRENT_HISTORY_WEEK",
 )
 
+def validate_topic_type(value):
+    """Ensure the YAML 'type' is one of the known topic types."""
+    value = cv.string_strict(value)
+    if value not in TOPIC_TYPES:
+        raise cv.Invalid(
+            f"Invalid dometic_cfx_ble type '{value}'. "
+            f"Valid values: {', '.join(TOPIC_TYPES)}"
+        )
+    return value
+
 CONFIG_SCHEMA = cv.Schema(
     {
         # use cv.declare_id, not cg.declare_id
