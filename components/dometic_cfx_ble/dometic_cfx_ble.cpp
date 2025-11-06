@@ -316,4 +316,267 @@ void DometicCfxBle::handle_gattc_event(esp_gattc_cb_event_t event,
         }
       }
 
-      // Kick protoc
+      // Kick protocol: ping + subscribe group
+      this->send_ping();
+      std::string sub_key = (product_type_ == 1)
+                                ? "SUBSCRIBE_APP_SZ"
+                                : (product_type_ == 2) ? "SUBSCRIBE_APP_SZI" : "SUBSCRIBE_APP_DZ";
+      this->send_sub(sub_key);
+
+      break;
+    }
+
+    case ESP_GATTC_NOTIFY_EVT: {
+      if (param->notify.is_notify &&
+          param->notify.value != nullptr &&
+          param->notify.value_len > 0) {
+        this->handle_notify_(param->notify.value, param->notify.value_len);
+      }
+      break;
+    }
+
+    case ESP_GATTC_DISCONNECT_EVT: {
+      ESP_LOGW(TAG, "GATTC disconnected, reason=%d", param->disconnect.reason);
+      connected_ = false;
+      write_handle_ = 0;
+      notify_handle_ = 0;
+      break;
+    }
+
+    case ESP_GATTC_WRITE_CHAR_EVT: {
+      if (param->write.status != ESP_GATT_OK) {
+        ESP_LOGW(TAG, "Write char status=%d", param->write.status);
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// ----------------- DDM frame handling ---------------------------------------
+
+void DometicCfxBle::handle_notify_(const uint8_t *data, size_t len) {
+  if (data == nullptr || len < 1) return;
+
+  uint8_t action = data[0];
+  ESP_LOGVV(TAG, "Notify frame: action=0x%02X len=%u", action, (unsigned) len);
+
+  // ACK / NAK in response to our PUB/SUB/PING
+  if (action == ACTION_ACK || action == ACTION_NAK) {
+    if (!send_queue_.empty()) {
+      send_queue_.pop();
+    }
+    if (action == ACTION_NAK) {
+      ESP_LOGW(TAG, "Fridge returned NAK");
+    }
+    last_activity_ms_ = millis();
+    return;
+  }
+
+  if (action != ACTION_PUB) {
+    ESP_LOGV(TAG, "Unhandled DDM action 0x%02X", action);
+    last_activity_ms_ = millis();
+    return;
+  }
+
+  if (len < 5) {
+    ESP_LOGW(TAG, "PUB frame too short: %u", (unsigned) len);
+    return;
+  }
+
+  // 4-byte param key, little-endian
+  uint32_t key = static_cast<uint32_t>(data[1]) |
+                 (static_cast<uint32_t>(data[2]) << 8) |
+                 (static_cast<uint32_t>(data[3]) << 16) |
+                 (static_cast<uint32_t>(data[4]) << 24);
+
+  std::string topic;
+  const TopicInfo *topic_info = nullptr;
+
+  for (const auto &kv : TOPICS) {
+    const TopicInfo &info = kv.second;
+    uint32_t tk = static_cast<uint32_t>(info.param[0]) |
+                  (static_cast<uint32_t>(info.param[1]) << 8) |
+                  (static_cast<uint32_t>(info.param[2]) << 16) |
+                  (static_cast<uint32_t>(info.param[3]) << 24);
+    if (tk == key) {
+      topic = kv.first;
+      topic_info = &info;
+      break;
+    }
+  }
+
+  if (topic_info == nullptr) {
+    ESP_LOGV(TAG, "Unknown DDM param key 0x%08X (len=%u)", (unsigned) key, (unsigned) len);
+    // Still ACK to keep the protocol happy
+    uint8_t ack = ACTION_ACK;
+    esp_ble_gattc_write_char(
+        gattc_if_, conn_id_, write_handle_, 1, &ack,
+        ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+    last_activity_ms_ = millis();
+    return;
+  }
+
+  std::vector<uint8_t> payload;
+  if (len > 5) {
+    payload.assign(data + 5, data + len);
+  }
+
+  ESP_LOGV(TAG, "PUB %s (%s) payload_len=%u",
+           topic.c_str(),
+           topic_info->type ? topic_info->type : "",
+           (unsigned) payload.size());
+
+  this->update_entity_(topic, payload);
+
+  // ACK this publish
+  uint8_t ack = ACTION_ACK;
+  esp_ble_gattc_write_char(
+      gattc_if_, conn_id_, write_handle_, 1, &ack,
+      ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
+
+  last_activity_ms_ = millis();
+}
+
+void DometicCfxBle::update_entity_(const std::string &topic, const std::vector<uint8_t> &value) {
+  std::string type_hint = "RAW";
+  auto ti = TOPICS.find(topic);
+  if (ti != TOPICS.end() && ti->second.type != nullptr) {
+    type_hint = ti->second.type;
+  }
+
+  // Sensor
+  if (auto it = sensors_.find(topic); it != sensors_.end()) {
+    float v = decode_to_float_(value, type_hint);
+    it->second->publish_state(v);
+    return;
+  }
+
+  // Binary sensor
+  if (auto it = binary_sensors_.find(topic); it != binary_sensors_.end()) {
+    bool v = decode_to_bool_(value, type_hint);
+    it->second->publish_state(v);
+    return;
+  }
+
+  // Switch
+  if (auto it = switches_.find(topic); it != switches_.end()) {
+    bool v = decode_to_bool_(value, type_hint);
+    it->second->publish_state(v);
+    return;
+  }
+
+  // Number
+  if (auto it = numbers_.find(topic); it != numbers_.end()) {
+    float v = decode_to_float_(value, type_hint);
+    it->second->publish_state(v);
+    return;
+  }
+
+  // Text sensor
+  if (auto it = text_sensors_.find(topic); it != text_sensors_.end()) {
+    std::string s = decode_to_string_(value, type_hint);
+    it->second->publish_state(s);
+    return;
+  }
+
+  ESP_LOGV(TAG, "No entity registered for topic '%s'", topic.c_str());
+}
+
+// ----------------- Generic encode/decode ------------------------------------
+
+float DometicCfxBle::decode_to_float_(const std::vector<uint8_t> &bytes, const std::string &type_hint) {
+  if (bytes.empty())
+    return NAN;
+
+  bool use_fixed_01 = false;
+  if (type_hint.find("DECI") != std::string::npos ||
+      type_hint.find("_0_1") != std::string::npos ||
+      type_hint.find("0.1") != std::string::npos) {
+    use_fixed_01 = true;
+  }
+
+  if (bytes.size() == 1) {
+    int8_t v = static_cast<int8_t>(bytes[0]);
+    return static_cast<float>(v);
+  }
+
+  if (bytes.size() >= 2) {
+    int16_t v = static_cast<int16_t>(bytes[0] |
+                                     (static_cast<int16_t>(bytes[1]) << 8));
+    if (use_fixed_01) {
+      return static_cast<float>(v) / 10.0f;
+    }
+    return static_cast<float>(v);
+  }
+
+  int32_t v = static_cast<int32_t>(
+      bytes[0] |
+      (static_cast<int32_t>(bytes[1]) << 8) |
+      (static_cast<int32_t>(bytes[2]) << 16) |
+      (static_cast<int32_t>(bytes[3]) << 24));
+  return static_cast<float>(v);
+}
+
+bool DometicCfxBle::decode_to_bool_(const std::vector<uint8_t> &bytes, const std::string & /*type_hint*/) {
+  if (bytes.empty()) return false;
+  return bytes[0] != 0;
+}
+
+std::string DometicCfxBle::decode_to_string_(const std::vector<uint8_t> &bytes, const std::string & /*type_hint*/) {
+  return std::string(bytes.begin(), bytes.end());
+}
+
+std::vector<uint8_t> DometicCfxBle::encode_from_bool_(bool value, const std::string & /*type_hint*/) {
+  return {static_cast<uint8_t>(value ? 1 : 0)};
+}
+
+std::vector<uint8_t> DometicCfxBle::encode_from_float_(float value, const std::string &type_hint) {
+  bool use_fixed_01 = false;
+  if (type_hint.find("DECI") != std::string::npos ||
+      type_hint.find("_0_1") != std::string::npos ||
+      type_hint.find("0.1") != std::string::npos) {
+    use_fixed_01 = true;
+  }
+
+  float scaled = value;
+  if (use_fixed_01) {
+    scaled = value * 10.0f;
+  }
+
+  int16_t v = static_cast<int16_t>(scaled);
+  std::vector<uint8_t> out;
+  out.reserve(2);
+  out.push_back(static_cast<uint8_t>(v & 0xFF));
+  out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  return out;
+}
+
+// ----------------- Entity helpers -------------------------------------------
+
+void DometicCfxBleSwitch::write_state(bool state) {
+  if (parent_ == nullptr) {
+    ESP_LOGW(TAG, "Switch write_state without parent");
+    publish_state(state);
+    return;
+  }
+
+  parent_->send_switch(topic_, state);
+  publish_state(state);
+}
+
+void DometicCfxBleNumber::control(float value) {
+  if (parent_ == nullptr) {
+    ESP_LOGW(TAG, "Number control without parent");
+    publish_state(value);
+    return;
+  }
+
+  parent_->send_number(topic_, value);
+  publish_state(value);
+}
+
+}  // namespace dometic_cfx_ble
+}  // namespace esphome
