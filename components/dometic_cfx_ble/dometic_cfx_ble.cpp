@@ -7,11 +7,8 @@
 namespace esphome {
 namespace dometic_cfx_ble {
 
-DometicCfxBle *DometicCfxBle::instance_ = nullptr;
-
 // UUIDs for the CFX3 BLE service and characteristics.
-// Replace these with the exact values from your reverse-engineering notes
-// if they differ.
+// Swap these if your bundle.js shows different values.
 static const uint8_t SERVICE_UUID_128[16] = {
     0x15, 0xd5, 0x3f, 0xe2, 0x04, 0x16, 0x6c, 0x92,
     0x1f, 0x48, 0x95, 0x09, 0x00, 0x03, 0x7a, 0x53,
@@ -27,13 +24,16 @@ static const uint8_t NOTIFY_CHAR_UUID_128[16] = {
     0x1f, 0x48, 0x95, 0x09, 0x02, 0x03, 0x7a, 0x53,
 };
 
-// Minimal topic map - enough to get the basic subscription handshake going.
-// Fill this out with the full table from your Python implementation.
+// Minimal topic map so the DDM plumbing is wired. You should extend this
+// with the full table from your Python DDM/TOPIC_TYPES so nothing is lost.
 const std::map<std::string, TopicInfo> TOPICS = {
     {"SUBSCRIBE_APP_SZ",  {{0x01, 0x00, 0x00, 0x81}, "EMPTY", "Subscribe single-zone app topics"}},
-    {"SUBSCRIBE_APP_SZI", {{0x02, 0x00, 0x00, 0x81}, "EMPTY", "Subscribe single-zone + ice maker app topics"}},
+    {"SUBSCRIBE_APP_SZI", {{0x02, 0x00, 0x00, 0x81}, "EMPTY", "Subscribe single-zone+ice app"}},
     {"SUBSCRIBE_APP_DZ",  {{0x03, 0x00, 0x00, 0x81}, "EMPTY", "Subscribe dual-zone app topics"}},
+    // Add all the other topics here; keep param[] EXACT as per bundle.js.
 };
+
+DometicCfxBle *DometicCfxBle::instance_ = nullptr;
 
 void DometicCfxBle::set_mac_address(const uint8_t *mac) {
   if (mac == nullptr) return;
@@ -47,9 +47,15 @@ void DometicCfxBle::setup() {
 
   esp_err_t err;
 
+  // Free classic BT RAM
   err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
     ESP_LOGW(TAG, "esp_bt_controller_mem_release failed: %d", err);
+  }
+
+  err = esp_ble_gap_register_callback(&DometicCfxBle::gap_event_handler);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_ble_gap_register_callback failed: %d", err);
   }
 
   err = esp_ble_gattc_register_callback(&DometicCfxBle::gattc_event_handler);
@@ -60,11 +66,6 @@ void DometicCfxBle::setup() {
   err = esp_ble_gattc_app_register(0);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "esp_ble_gattc_app_register failed: %d", err);
-  }
-
-  err = esp_ble_gap_register_callback(&DometicCfxBle::gap_event_handler);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_ble_gap_register_callback failed: %d", err);
   }
 
   this->start_scan_();
@@ -81,12 +82,12 @@ void DometicCfxBle::dump_config() {
 void DometicCfxBle::loop() {
   const uint32_t now = millis();
 
-  // Periodic ping to keep the link alive if we are connected.
+  // Keepalive ping
   if (connected_ && (now - last_activity_ms_ > 15000U)) {
     this->send_ping();
   }
 
-  // Flush send queue.
+  // Flush send queue
   if (connected_ && write_handle_ != 0 && !send_queue_.empty()) {
     auto packet = std::move(send_queue_.front());
     send_queue_.pop();
@@ -103,6 +104,8 @@ void DometicCfxBle::loop() {
     }
   }
 }
+
+// ----------------- Frame-level DDM helpers -----------------------------------
 
 void DometicCfxBle::send_pub(const std::string &topic, const std::vector<uint8_t> &value) {
   auto it = TOPICS.find(topic);
@@ -138,11 +141,32 @@ void DometicCfxBle::send_sub(const std::string &topic) {
 }
 
 void DometicCfxBle::send_ping() {
-  std::vector<uint8_t> packet;
-  packet.reserve(1);
-  packet.push_back(ACTION_PING);
+  std::vector<uint8_t> packet(1);
+  packet[0] = ACTION_PING;
   send_queue_.push(std::move(packet));
 }
+
+void DometicCfxBle::send_switch(const std::string &topic, bool value) {
+  std::string type_hint = "BOOL";
+  auto it = TOPICS.find(topic);
+  if (it != TOPICS.end() && it->second.type != nullptr) {
+    type_hint = it->second.type;
+  }
+  auto payload = this->encode_from_bool_(value, type_hint);
+  this->send_pub(topic, payload);
+}
+
+void DometicCfxBle::send_number(const std::string &topic, float value) {
+  std::string type_hint = "NUMBER";
+  auto it = TOPICS.find(topic);
+  if (it != TOPICS.end() && it->second.type != nullptr) {
+    type_hint = it->second.type;
+  }
+  auto payload = this->encode_from_float_(value, type_hint);
+  this->send_pub(topic, payload);
+}
+
+// ----------------- GAP / GATTC plumbing -------------------------------------
 
 void DometicCfxBle::start_scan_() {
   if (scan_in_progress_) return;
@@ -161,7 +185,7 @@ void DometicCfxBle::start_scan_() {
     return;
   }
 
-  // We'll actually start scanning from the SCAN_PARAM_SET_COMPLETE event.
+  // Actual start happens in SCAN_PARAM_SET_COMPLETE
   scan_in_progress_ = true;
 }
 
@@ -181,22 +205,22 @@ void DometicCfxBle::connect_() {
   }
 }
 
-// Static trampoline callbacks
-
+// Static trampolines
 void DometicCfxBle::gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   if (instance_ != nullptr) {
     instance_->handle_gap_event(event, param);
   }
 }
 
-void DometicCfxBle::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param) {
+void DometicCfxBle::gattc_event_handler(esp_gattc_cb_event_t event,
+                                        esp_gatt_if_t gatt_if,
+                                        esp_ble_gattc_cb_param_t *param) {
   if (instance_ != nullptr) {
     instance_->handle_gattc_event(event, gatt_if, param);
   }
 }
 
-// Instance-level handlers
-
+// Instance handlers
 void DometicCfxBle::handle_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   switch (event) {
     case ESP_GAP_BLE_SCAN_PARAM_SET_COMPLETE_EVT: {
@@ -229,7 +253,9 @@ void DometicCfxBle::handle_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_c
   }
 }
 
-void DometicCfxBle::handle_gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param) {
+void DometicCfxBle::handle_gattc_event(esp_gattc_cb_event_t event,
+                                       esp_gatt_if_t gatt_if,
+                                       esp_ble_gattc_cb_param_t *param) {
   switch (event) {
     case ESP_GATTC_REG_EVT: {
       gattc_if_ = gatt_if;
@@ -244,163 +270,50 @@ void DometicCfxBle::handle_gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t
         last_activity_ms_ = millis();
         ESP_LOGI(TAG, "GATTC connected, conn_id=%d", conn_id_);
 
-        // Discover primary service and characteristics – intentionally left
-        // minimal here. You can extend this with esp_ble_gattc_search_service
-        // and get_all_char to locate WRITE/NOTIFY handles, then enable CCCD.
+        esp_bt_uuid_t service_uuid{};
+        service_uuid.len = ESP_UUID_LEN_128;
+        std::memcpy(service_uuid.uuid.uuid128, SERVICE_UUID_128, sizeof(SERVICE_UUID_128));
+        esp_ble_gattc_search_service(gatt_if, conn_id_, &service_uuid);
       } else {
         ESP_LOGW(TAG, "GATTC open failed, status=%d", param->open.status);
       }
       break;
     }
 
-    case ESP_GATTC_NOTIFY_EVT: {
-      if (param->notify.is_notify && param->notify.value != nullptr && param->notify.value_len > 0) {
-        this->handle_notify_(param->notify.value, param->notify.value_len);
+    case ESP_GATTC_SEARCH_CMPL_EVT: {
+      // Find write + notify chars
+      esp_bt_uuid_t write_uuid{};
+      write_uuid.len = ESP_UUID_LEN_128;
+      std::memcpy(write_uuid.uuid.uuid128, WRITE_CHAR_UUID_128, sizeof(WRITE_CHAR_UUID_128));
+
+      esp_bt_uuid_t notify_uuid{};
+      notify_uuid.len = ESP_UUID_LEN_128;
+      std::memcpy(notify_uuid.uuid.uuid128, NOTIFY_CHAR_UUID_128, sizeof(NOTIFY_CHAR_UUID_128));
+
+      esp_gattc_char_elem_t char_elem[2];
+      uint16_t count = 0;
+
+      if (esp_ble_gattc_get_char_by_uuid(
+              gatt_if, conn_id_, 0, 0xFFFF, write_uuid, char_elem, &count) == ESP_OK &&
+          count > 0) {
+        write_handle_ = char_elem[0].char_handle;
       }
-      break;
-    }
 
-    case ESP_GATTC_DISCONNECT_EVT: {
-      ESP_LOGW(TAG, "GATTC disconnected, reason=%d", param->disconnect.reason);
-      connected_ = false;
-      write_handle_ = 0;
-      notify_handle_ = 0;
-      break;
-    }
+      count = 0;
+      if (esp_ble_gattc_get_char_by_uuid(
+              gatt_if, conn_id_, 0, 0xFFFF, notify_uuid, char_elem, &count) == ESP_OK &&
+          count > 0) {
+        notify_handle_ = char_elem[0].char_handle;
+      }
 
-    default:
-      break;
-  }
-}
+      if (notify_handle_ != 0) {
+        uint8_t cccd[2] = {0x01, 0x00};
+        esp_err_t err = esp_ble_gattc_write_char_descr(
+            gatt_if, conn_id_, notify_handle_ + 1, sizeof(cccd), cccd,
+            ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NONE);
+        if (err != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to enable notifications, err=%d", err);
+        }
+      }
 
-// Very small and conservative notify handler – it only logs frames for now.
-// You can extend this to fully decode the DDM protocol and call update_entity_.
-void DometicCfxBle::handle_notify_(const uint8_t *data, size_t len) {
-  if (len == 0 || data == nullptr) return;
-
-  uint8_t action = data[0];
-  ESP_LOGV(TAG, "Notify: action=0x%02X, len=%u", action, (unsigned) len);
-
-  // For now we only bump the activity timer; all detailed decoding is left
-  // for the next iteration once the GATT plumbing is stable.
-  last_activity_ms_ = millis();
-}
-
-void DometicCfxBle::update_entity_(const std::string &topic, const std::vector<uint8_t> &value) {
-  auto it_s = sensors_.find(topic);
-  if (it_s != sensors_.end()) {
-    float v = decode_to_float_(value, "sensor");
-    it_s->second->publish_state(v);
-    return;
-  }
-
-  auto it_b = binary_sensors_.find(topic);
-  if (it_b != binary_sensors_.end()) {
-    bool v = decode_to_bool_(value, "binary_sensor");
-    it_b->second->publish_state(v);
-    return;
-  }
-
-  auto it_sw = switches_.find(topic);
-  if (it_sw != switches_.end()) {
-    bool v = decode_to_bool_(value, "switch");
-    it_sw->second->publish_state(v);
-    return;
-  }
-
-  auto it_n = numbers_.find(topic);
-  if (it_n != numbers_.end()) {
-    float v = decode_to_float_(value, "number");
-    it_n->second->publish_state(v);
-    return;
-  }
-
-  auto it_t = text_sensors_.find(topic);
-  if (it_t != text_sensors_.end()) {
-    std::string s = decode_to_string_(value, "text_sensor");
-    it_t->second->publish_state(s);
-    return;
-  }
-
-  ESP_LOGV(TAG, "update_entity_: no entity registered for topic '%s'", topic.c_str());
-}
-
-// Extremely conservative default decoding helpers.
-// These don't assume detailed knowledge of the protocol; they just apply
-// basic interpretations so that at least something sensible is shown.
-// You can replace these with the exact rules from your DDM implementation.
-
-float DometicCfxBle::decode_to_float_(const std::vector<uint8_t> &bytes, const std::string & /*type_hint*/) {
-  if (bytes.empty())
-    return NAN;
-
-  if (bytes.size() == 1) {
-    int8_t v = static_cast<int8_t>(bytes[0]);
-    return static_cast<float>(v);
-  }
-
-  if (bytes.size() == 2) {
-    int16_t v = static_cast<int16_t>(bytes[0] | (static_cast<int16_t>(bytes[1]) << 8));
-    return static_cast<float>(v) / 10.0f;  // assume fixed-point 0.1
-  }
-
-  // Fallback: treat first 4 bytes as signed 32-bit integer, little endian.
-  int32_t v = static_cast<int32_t>(
-      bytes[0] |
-      (static_cast<int32_t>(bytes[1]) << 8) |
-      (static_cast<int32_t>(bytes[2]) << 16) |
-      (static_cast<int32_t>(bytes[3]) << 24));
-  return static_cast<float>(v);
-}
-
-bool DometicCfxBle::decode_to_bool_(const std::vector<uint8_t> &bytes, const std::string & /*type_hint*/) {
-  if (bytes.empty()) return false;
-  return bytes[0] != 0;
-}
-
-std::string DometicCfxBle::decode_to_string_(const std::vector<uint8_t> &bytes, const std::string & /*type_hint*/) {
-  return std::string(bytes.begin(), bytes.end());
-}
-
-std::vector<uint8_t> DometicCfxBle::encode_from_bool_(bool value, const std::string & /*type_hint*/) {
-  return {static_cast<uint8_t>(value ? 1 : 0)};
-}
-
-std::vector<uint8_t> DometicCfxBle::encode_from_float_(float value, const std::string & /*type_hint*/) {
-  // Default: encode as signed 16-bit fixed-point with 0.1 resolution.
-  int16_t v = static_cast<int16_t>(value * 10.0f);
-  std::vector<uint8_t> out;
-  out.reserve(2);
-  out.push_back(static_cast<uint8_t>(v & 0xFF));
-  out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
-  return out;
-}
-
-// Per-platform classes – just thin wrappers around send_pub / decode helpers.
-
-void DometicCfxBleSwitch::write_state(bool state) {
-  if (parent_ == nullptr) {
-    ESP_LOGW(TAG, "Switch write_state without parent");
-    publish_state(state);
-    return;
-  }
-
-  auto payload = parent_->encode_from_bool_(state, "switch");
-  parent_->send_pub(topic_, payload);
-  publish_state(state);
-}
-
-void DometicCfxBleNumber::control(float value) {
-  if (parent_ == nullptr) {
-    ESP_LOGW(TAG, "Number control without parent");
-    publish_state(value);
-    return;
-  }
-
-  auto payload = parent_->encode_from_float_(value, "number");
-  parent_->send_pub(topic_, payload);
-  publish_state(value);
-}
-
-}  // namespace dometic_cfx_ble
-}  // namespace esphome
+      // Kick protoc

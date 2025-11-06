@@ -7,8 +7,8 @@
 
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
-#include "esphome/components/number/number.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/number/number.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 
 #include <esp_gap_ble_api.h>
@@ -30,15 +30,13 @@ namespace dometic_cfx_ble {
 static const char *const TAG = "dometic_cfx_ble";
 
 // Simple description of a protocol topic.
-// For now we only need the 4-byte "param" key; type/desc are informational.
 struct TopicInfo {
-  uint8_t param[4];
-  const char *type;
+  uint8_t param[4];       // 4-byte DDM key
+  const char *type;       // type hint string from your DDM table
   const char *description;
 };
 
-// Action codes in the DDM protocol. Values here are placeholders; adjust if needed
-// to match the real protocol constants from your bundle.js.
+// DDM action codes (update to match your bundle.js if needed)
 enum : uint8_t {
   ACTION_PUB   = 0x01,
   ACTION_SUB   = 0x02,
@@ -49,7 +47,7 @@ enum : uint8_t {
   ACTION_NOP   = 0x07,
 };
 
-// Minimal topic map; you can extend this with the full set from your Python map.
+// Full topic table lives in the .cpp
 extern const std::map<std::string, TopicInfo> TOPICS;
 
 class DometicCfxBle : public Component {
@@ -61,7 +59,6 @@ class DometicCfxBle : public Component {
 
   template<typename T>
   void add_entity(const std::string &topic, T *entity) {
-    // Classify entity at compile-time based on base class.
     if constexpr (std::is_base_of<sensor::Sensor, T>::value) {
       sensors_[topic] = entity;
     } else if constexpr (std::is_base_of<binary_sensor::BinarySensor, T>::value) {
@@ -81,22 +78,29 @@ class DometicCfxBle : public Component {
   void loop() override;
   void dump_config() override;
 
-  // Low-level protocol helpers used by the per-entity classes.
+  // Frame-level helpers used internally and by child entities
   void send_pub(const std::string &topic, const std::vector<uint8_t> &value);
   void send_sub(const std::string &topic);
   void send_ping();
 
-  // Static entry points for the ESP-IDF callbacks.
+  // High-level helpers so entities don’t call protected helpers directly
+  void send_switch(const std::string &topic, bool value);
+  void send_number(const std::string &topic, float value);
+
+  // Static callback entrypoints
   static DometicCfxBle *instance_;
 
   static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
-  static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param);
+  static void gattc_event_handler(esp_gattc_cb_event_t event,
+                                  esp_gatt_if_t gatt_if,
+                                  esp_ble_gattc_cb_param_t *param);
 
-  // Instance handlers where we can safely touch members.
+  // Instance handlers
   void handle_gap_event(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param);
-  void handle_gattc_event(esp_gattc_cb_event_t event, esp_gatt_if_t gatt_if, esp_ble_gattc_cb_param_t *param);
+  void handle_gattc_event(esp_gattc_cb_event_t event,
+                          esp_gatt_if_t gatt_if,
+                          esp_ble_gattc_cb_param_t *param);
 
-  // Exposed for the per-entity classes.
   bool is_connected() const { return connected_; }
 
  protected:
@@ -105,6 +109,7 @@ class DometicCfxBle : public Component {
   void handle_notify_(const uint8_t *data, size_t len);
   void update_entity_(const std::string &topic, const std::vector<uint8_t> &value);
 
+  // Generic decoding helpers; the exact strings just need to match your DDM table.
   float decode_to_float_(const std::vector<uint8_t> &bytes, const std::string &type_hint);
   bool decode_to_bool_(const std::vector<uint8_t> &bytes, const std::string &type_hint);
   std::string decode_to_string_(const std::vector<uint8_t> &bytes, const std::string &type_hint);
@@ -134,14 +139,13 @@ class DometicCfxBle : public Component {
   std::map<std::string, text_sensor::TextSensor *> text_sensors_;
 };
 
-// Per-platform helper classes. These are deliberately kept very small and
-// delegate all protocol work back to the hub.
+// Thin wrappers around the hub. These just call back into DometicCfxBle.
 
 class DometicCfxBleSensor : public sensor::Sensor, public PollingComponent {
  public:
   void set_parent(DometicCfxBle *parent) { parent_ = parent; }
   void set_topic(const std::string &topic) { topic_ = topic; }
-  void update() override {}  // sensors are push-driven by notifications
+  void update() override {}  // notifications only
 
  protected:
   DometicCfxBle *parent_{nullptr};
@@ -152,7 +156,7 @@ class DometicCfxBleBinarySensor : public binary_sensor::BinarySensor, public Pol
  public:
   void set_parent(DometicCfxBle *parent) { parent_ = parent; }
   void set_topic(const std::string &topic) { topic_ = topic; }
-  void update() override {}  // push-only
+  void update() override {}  // notifications only
 
  protected:
   DometicCfxBle *parent_{nullptr};
@@ -165,7 +169,7 @@ class DometicCfxBleSwitch : public switch_::Switch, public PollingComponent {
   void set_topic(const std::string &topic) { topic_ = topic; }
 
   void write_state(bool state) override;
-  void update() override {}  // no periodic polling
+  void update() override {}  // no polling
 
  protected:
   DometicCfxBle *parent_{nullptr};
@@ -178,7 +182,7 @@ class DometicCfxBleNumber : public number::Number, public PollingComponent {
   void set_topic(const std::string &topic) { topic_ = topic; }
 
   void control(float value) override;
-  void update() override {}  // no periodic polling
+  void update() override {}  // no polling
 
  protected:
   DometicCfxBle *parent_{nullptr};
@@ -189,7 +193,7 @@ class DometicCfxBleTextSensor : public text_sensor::TextSensor, public PollingCo
  public:
   void set_parent(DometicCfxBle *parent) { parent_ = parent; }
   void set_topic(const std::string &topic) { topic_ = topic; }
-  void update() override {}  // push-only
+  void update() override {}  // notifications only
 
  protected:
   DometicCfxBle *parent_{nullptr};
