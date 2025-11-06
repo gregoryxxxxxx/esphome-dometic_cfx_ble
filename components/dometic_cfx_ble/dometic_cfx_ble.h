@@ -58,7 +58,7 @@ class DometicCfxBle : public Component {
  public:
   float get_setup_priority() const override { return setup_priority::BLUETOOTH; }
 
-  void set_mac_address(const uint8_t *mac);
+  void set_mac_address(uint64_t mac);
   void set_product_type(uint8_t type) { this->product_type_ = type; }
 
   template<typename T>

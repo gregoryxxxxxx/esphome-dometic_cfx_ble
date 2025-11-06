@@ -117,10 +117,18 @@ DometicCfxBle *DometicCfxBle::instance_ = nullptr;
 
 // ----------------- Basic setup / loop ---------------------------------------
 
-void DometicCfxBle::set_mac_address(const uint8_t *mac) {
-  if (mac == nullptr) return;
-  std::memcpy(this->mac_address_, mac, 6);
+void DometicCfxBle::set_mac_address(uint64_t mac) {
+  // config[CONF_MAC_ADDRESS].as_hex gives e.g. 0xB0B21C449F76
+  // We want bytes B0:B2:1C:44:9F:76 in mac_address_[0..5]
+  for (int i = 0; i < 6; i++) {
+    this->mac_address_[5 - i] = static_cast<uint8_t>((mac >> (8 * i)) & 0xFF);
+  }
+
+  ESP_LOGI(TAG, "Configured MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+           mac_address_[0], mac_address_[1], mac_address_[2],
+           mac_address_[3], mac_address_[4], mac_address_[5]);
 }
+
 
 void DometicCfxBle::setup() {
   ESP_LOGI(TAG, "Initializing Dometic CFX3 BLE hub");
