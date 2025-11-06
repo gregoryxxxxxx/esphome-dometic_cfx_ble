@@ -21,7 +21,7 @@ DometicCfxBleSensor = dometic_cfx_ble_ns.class_("DometicCfxBleSensor", esphome_s
 
 CONFIG_SCHEMA = esphome_sensor.sensor_schema(
     unit_of_measurement=CONF_UNIT_OF_MEASUREMENT,
-    accuracy_decimals=CONF_ACCURACY_DECIMALS
+    accuracy_decimals=1
 ).extend({
     cv.GenerateID(): cv.declare_id(DometicCfxBleSensor),
     cv.Required(CONF_DOMETIC_CFX_BLE_ID): cv.use_id(DometicCfxBle),
