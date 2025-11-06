@@ -1,10 +1,21 @@
-# sensor.py
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_DOMETIC_CFX_BLE_ID, CONF_TYPE, CONF_NAME, CONF_UNIT_OF_MEASUREMENT, CONF_ACCURACY_DECIMALS
-from esphome.cpp_types import sensor as esphome_sensor
+from esphome.components import sensor
+from esphome.const import (
+    CONF_ID,
+    CONF_TYPE,
+    CONF_NAME,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_ACCURACY_DECIMALS,
+)
 
-from . import dometic_cfx_ble_ns, DometicCfxBle, TOPIC_TYPES, validate_topic_type
+from . import (
+    dometic_cfx_ble_ns,
+    DometicCfxBle,
+    CONF_DOMETIC_CFX_BLE_ID,
+    entity_schema,
+)
+
 
 DometicCfxBleSensor = dometic_cfx_ble_ns.class_("DometicCfxBleSensor", esphome_sensor.Sensor, cg.PollingComponent)
 
