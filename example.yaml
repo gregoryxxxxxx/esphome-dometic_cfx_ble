@@ -17,6 +17,8 @@ web_server:
 logger:  
   level: DEBUG
 
+api:
+
 ota:
 - platform: esphome
 
