@@ -155,6 +155,6 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     ble_client_var = await cg.get_variable(config[CONF_BLE_CLIENT_ID])
-    cg.add(ble_client_var.add_node(var)) 
+    cg.add(ble_client_var.register_ble_node(var))
     cg.add(var.set_product_type(config[CONF_PRODUCT_TYPE]))
 
