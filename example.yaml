@@ -27,7 +27,7 @@ wifi:
   password: !secret wifi_password
 
 ble_client:
-  - mac_address: B0:B2:1C:44:9F:76  # Your CFX MAC
+  - mac_address: AA:BB:CC:DD:EE:FF  # Your CFX MAC
     id: cfx_ble_client
     auto_connect: true  
 
